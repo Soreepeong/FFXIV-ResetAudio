@@ -15,6 +15,9 @@ using System.Runtime.InteropServices;
 
 namespace ResetAudio {
     public unsafe sealed class Plugin : IDalamudPlugin {
+        // When this signature breaks, look for references to the following GUIDs in the game binary.
+        // IID_IMMDeviceEnumerator: A95664D2-9614-4F35-A746-DE8DB63617E6
+        // CLSID_MMDeviceEnumerator: bcde0395-e52f-467c-8e3d-c4579291692e
         private static readonly string XIV_AUDIO_ENUMERATOR_INITIALIZE_SIGNATURE = string.Join(' ', new string[]{
             // Function preamble
             /* 0x00 */ "48 89 5c 24 ??"             , // MOV [rsp+0x08], rbx
