@@ -1,17 +1,20 @@
-﻿using Dalamud;
-using Dalamud.Game;
+﻿using Dalamud.Game;
 using Dalamud.Game.ClientState;
 using Dalamud.Game.Command;
+using Dalamud.Game.Gui;
+using Dalamud.Interface;
 using Dalamud.IoC;
 using Dalamud.Logging;
 using Dalamud.Plugin;
 using ImGuiNET;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using static ResetAudio.CantBelieveItsNotCpp;
 
 namespace ResetAudio {
     public unsafe sealed class Plugin : IDalamudPlugin {
@@ -43,26 +46,21 @@ namespace ResetAudio {
             /* 0x34 */ "48 89 43 ??"                , // MOV [rbx+0x08], rax                      // <2> Assign IMMNotificationClientVtbl
         });
 
-        private static readonly HashSet<PropertyKey> IGNORE_PROPERTY_KEYS = new() {
-            // I have no idea when is this property change triggered but whatever
-            new PropertyKey() {
-                FmtId = new Guid(0x9855c4cd, 0xdf8c, 0x449c, 0xa1, 0x81, 0x81, 0x91, 0xb6, 0x8b, 0xd0, 0x6c),
-                Pid = 0
-            }
-        };
-
         public string Name => "Reset Audio";
         private readonly string SlashCommand = "/resetaudio";
+        private readonly string SlashCommandHelpMessage = "Manually trigger game audio reset.\n* /resetaudio (r|reset): Reset audio right now.\n* /resetaudio c|configure: Open ResetAudio configuration window.\n* /resetaudio h|help: Print help message.";
 
         private readonly DalamudPluginInterface _pluginInterface;
         private readonly CommandManager _commandManager;
+        private readonly ChatGui _chatGui;
         private readonly Configuration _config;
 
         private readonly List<IDisposable> _disposableList = new();
+        private readonly CancellationTokenSource _disposeToken;
 
         private readonly IMMDeviceEnumerator _pDeviceEnumerator;
 
-        private IMMNotificationClientVtbl* _pNotificationClientVtbl = null;
+        private readonly IMMNotificationClientVtbl* _pNotificationClientVtbl;
         private readonly IMMNotificationClientVtbl _notificationClientVtblOriginalValue;
 
         private readonly bool* _resetAudio;
@@ -79,14 +77,23 @@ namespace ResetAudio {
         private readonly OnDefaultDeviceChangedDelegate _newOnDefaultDeviceChanged;
         private readonly OnPropertyValueChangedDelegate _newOnPropertyValueChanged;
 
+        private readonly Dictionary<PropertyKey, int> _propertyUpdateCount = new();
+        private readonly Dictionary<PropertyKey, DateTime> _propertyUpdateLatest = new();
+
+        private Task? _resetAudioSoonTask;
+
         public Plugin(
             [RequiredVersion("1.0")] DalamudPluginInterface pluginInterface,
             [RequiredVersion("1.0")] CommandManager commandManager,
             [RequiredVersion("1.0")] ClientState clientState,
+            [RequiredVersion("1.0")] ChatGui chatGui,
             [RequiredVersion("1.0")] SigScanner sigScanner) {
             try {
                 _pluginInterface = pluginInterface;
                 _commandManager = commandManager;
+                _chatGui = chatGui;
+
+                _disposableList.Add(_disposeToken = new());
 
                 _config = _pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
                 _config.Initialize(_pluginInterface);
@@ -130,7 +137,9 @@ namespace ResetAudio {
                     VirtualProtect(pVtbl, (UIntPtr)Marshal.SizeOf<IMMNotificationClientVtbl>(), prevMemoryProtection, out _);
                 }
 
-                commandManager.AddHandler(SlashCommand, new((_, _) => ResetAudioNow()) { });
+                commandManager.AddHandler(SlashCommand, new(OnCommand) {
+                    HelpMessage = SlashCommandHelpMessage,
+                });
             } catch {
                 Dispose();
                 throw;
@@ -145,6 +154,8 @@ namespace ResetAudio {
         }
 
         public void Dispose() {
+            _disposeToken.Cancel();
+
             _commandManager.RemoveHandler(SlashCommand);
 
             if (_pDeviceEnumerator != null)
@@ -160,74 +171,269 @@ namespace ResetAudio {
             }
 
             Save();
+
             foreach (var item in _disposableList.AsEnumerable().Reverse()) {
                 try {
                     item.Dispose();
                 } catch (Exception e) {
-                    PluginLog.Warning(e, "Dispose failure");
+                    PluginLog.Warning(e, "{0}: Dispose failure", item);
                 }
             }
             _disposableList.Clear();
         }
 
         private void DrawUI() {
-            ImGui.SetNextWindowSize(new Vector2(400, 640), ImGuiCond.Once);
+            if (!_config.ConfigVisible)
+                return;
 
-            if (_config.ConfigVisible) {
-                if (ImGui.Begin("ResetAudio", ref _config.ConfigVisible, ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse))
-                    try {
-                        if (ImGui.Button("Reset Audio Now")) {
-                            ResetAudioNow();
+            var scale = ImGui.GetIO().FontGlobalScale;
+            var windowFlags = ImGuiWindowFlags.NoCollapse;
+            Vector2 windowSize;
+            if (_config.AdvanceConfigExpanded) {
+                windowSize = new Vector2(720, 320) * scale;
+                ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, windowSize);
+                ImGui.SetNextWindowSize(windowSize, ImGuiCond.Once);
+
+            } else {
+                windowSize = new Vector2(450, 135) * scale;
+                ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, windowSize);
+                ImGui.SetNextWindowSize(windowSize, ImGuiCond.Always);
+                windowFlags |= ImGuiWindowFlags.NoResize;
+            }
+
+            if (ImGui.Begin("ResetAudio Configuration###MainWindow", ref _config.ConfigVisible, windowFlags)) {
+                try {
+                    if (ImGui.Button("Reset Audio Now"))
+                        ResetAudioNow(DeviceResetTriggerReason.UserRequest);
+
+                    ImGui.SameLine();
+                    ImGui.TextUnformatted("Use /resetaudio to invoke it as a text command.");
+
+                    ImGuiHelpers.ScaledDummy(10);
+
+                    var changed = false;
+                    changed |= ImGui.Checkbox("Log audio reset notice message to default log channel", ref _config.PrintAudioResetToChat);
+                    changed |= ImGui.Checkbox("Show advanced configuration", ref _config.AdvanceConfigExpanded);
+                    if (_config.AdvanceConfigExpanded) {
+                        ImGuiHelpers.ScaledDummy(10);
+
+                        changed |= ImGui.Checkbox("Do not relay audio device change notification to game", ref _config.SuppressMultimediaDeviceChangeNotificationToGame);
+                        changed |= ImGui.SliderInt("Merge audio reset requests (ms)", ref _config.CoalesceAudioResetRequestDurationMs, 50, 1000);
+
+                        ImGuiHelpers.ScaledDummy(10);
+
+                        ImGui.TextUnformatted("Do not reset audio when following property changes:");
+                        ImGui.SameLine(ImGui.GetWindowContentRegionWidth() - 120 * scale);
+                        if (ImGui.Button($"Reset Counter###table#Reset Counter", new(120 * scale, 0))) {
+                            _propertyUpdateLatest.Clear();
+                            _propertyUpdateCount.Clear();
                         }
-                    } finally { ImGui.End(); }
-                else {
-                    Save();
-                }
+
+                        if (ImGui.BeginTable("table", 6)) {
+                            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 20 * scale);  // Enable/Disable checkbox
+                            ImGui.TableSetupColumn("Property Key", ImGuiTableColumnFlags.WidthFixed, 300 * scale);
+                            ImGui.TableSetupColumn("Comment", ImGuiTableColumnFlags.WidthStretch);
+                            ImGui.TableSetupColumn("Last Seen", ImGuiTableColumnFlags.WidthFixed);
+                            ImGui.TableSetupColumn("Count", ImGuiTableColumnFlags.WidthFixed);
+                            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 60 * scale);  // Add/Delete button
+                            ImGui.TableHeadersRow();
+
+                            for (var i = 0; i < _config.IgnorePropertyUpdateKeys.Count; i++) {
+                                var prop = _config.IgnorePropertyUpdateKeys[i];
+
+                                ImGui.TableNextRow();
+
+                                ImGui.TableSetColumnIndex(0);
+                                changed |= ImGui.Checkbox($"###table#{prop.PropKey}#Enable", ref prop.Enable);
+
+                                ImGui.TableSetColumnIndex(1);
+                                ImGui.TextUnformatted(prop.PropKey.ToString());
+
+                                ImGui.TableSetColumnIndex(2);
+                                ImGui.PushItemWidth(ImGui.GetColumnWidth());
+                                changed |= ImGui.InputText($"###table#{prop.PropKey}#Comment", ref prop.Comment, 1024);
+                                ImGui.PopItemWidth();
+
+                                ImGui.TableSetColumnIndex(3);
+                                if (_propertyUpdateLatest.TryGetValue(prop.PropKey, out var value))
+                                    ImGui.TextUnformatted($"{FormatTimeAgo(value)}");
+                                else
+                                    ImGui.TextUnformatted("Never");
+
+                                ImGui.TableSetColumnIndex(4);
+                                ImGui.TextUnformatted($"{_propertyUpdateCount.GetValueOrDefault(prop.PropKey, 0)}");
+
+                                ImGui.TableSetColumnIndex(5);
+                                if (ImGui.Button($"Delete###table#{prop.PropKey}#Delete", new(ImGui.GetColumnWidth(), 0))) {
+                                    _config.IgnorePropertyUpdateKeys.RemoveAt(i);
+                                    changed = true;
+                                    i--;
+                                }
+                            }
+
+                            foreach (var key in _propertyUpdateLatest.Keys) {
+                                if (_config.IgnorePropertyUpdateKeys.Any(x => x.PropKey == key))
+                                    continue;
+
+                                ImGui.TableNextRow();
+
+                                ImGui.TableSetColumnIndex(1);
+                                ImGui.TextUnformatted(key.ToString());
+
+                                ImGui.TableSetColumnIndex(3);
+                                ImGui.TextUnformatted($"{FormatTimeAgo(_propertyUpdateLatest[key])}");
+
+                                ImGui.TableSetColumnIndex(4);
+                                ImGui.TextUnformatted($"{_propertyUpdateCount[key]}");
+
+                                ImGui.TableSetColumnIndex(5);
+                                if (ImGui.Button($"Add###table#{key}#Add", new(ImGui.GetColumnWidth(), 0))) {
+                                    _config.IgnorePropertyUpdateKeys.Add(new() {
+                                        PropKey = key,
+                                        Comment = "",
+                                        Enable = true,
+                                    });
+                                    changed = true;
+                                }
+                            }
+
+                            ImGui.EndTable();
+                        }
+                    }
+
+                    if (changed)
+                        Save();
+                } finally { ImGui.End(); }
+            } else {
+                Save();
+            }
+
+            ImGui.PopStyleVar();
+        }
+
+        private void OnCommand(string command, string arguments) {
+            arguments = arguments.Trim().ToLowerInvariant();
+            if (arguments == "") {
+                ResetAudioNow(DeviceResetTriggerReason.UserRequest);
+
+            } else if (arguments.Length > 0 && arguments.Length <= 9 && "configure"[..arguments.Length] == arguments) {
+                _config.ConfigVisible = true;
+                Save();
+
+            } else if (arguments.Length > 0 && arguments.Length <= 5 && "reset"[..arguments.Length] == arguments) {
+                ResetAudioNow(DeviceResetTriggerReason.UserRequest);
+
+            } else if (arguments.Length > 0 && arguments.Length <= 4 && "help"[..arguments.Length] == arguments) {
+                _chatGui.Print(SlashCommandHelpMessage);
+
+            } else {
+                _chatGui.PrintError(string.Format("Invalid argument supplied: \"{0}\". Type \"/resetaudio help\" for help.", arguments));
             }
         }
 
-        private void ResetAudioNow() {
-            PluginLog.Information("Resetting audio NOW!");
+        private void ResetAudioNow(DeviceResetTriggerReason reason) {
+            PluginLog.Information("Resetting audio NOW! (Reason: {0})", reason);
+
+            if (_config.PrintAudioResetToChat)
+                _chatGui.Print(string.Format("[{0}] Resetting audio. (Reason: {1})", Name, reason));
+
             *_resetAudio = true;
+        }
+
+        private void ResetAudioSoon(DeviceResetTriggerReason reason) {
+            if (_resetAudioSoonTask != null)
+                return;
+
+            PluginLog.Information("Resetting audio SOON! (Reason: {0})", reason);
+
+            _resetAudioSoonTask = Task.Run(() => {
+                try {
+                    Task.Delay(_config.CoalesceAudioResetRequestDurationMs, _disposeToken.Token).Wait();
+                    if (_disposeToken.IsCancellationRequested)
+                        return;
+
+                    ResetAudioNow(reason);
+                } catch (Exception) {
+                    // Don't know, don't care
+                } finally {
+                    _resetAudioSoonTask = null;
+                }
+            });
         }
 
         private int OnDeviceStateChanged(IMMNotificationClientVtbl* pNotificationClient, string deviceId, uint dwNewState) {
             PluginLog.Information("OnDeviceStateChanged({0}, {1})", GetDeviceFriendlyName(deviceId), dwNewState);
-            return _originalOnDeviceStateChanged(pNotificationClient, deviceId, dwNewState);
+            return _config.SuppressMultimediaDeviceChangeNotificationToGame ? 0 : _originalOnDeviceStateChanged(pNotificationClient, deviceId, dwNewState);
         }
 
         private int OnDeviceAdded(IMMNotificationClientVtbl* pNotificationClient, string deviceId) {
             PluginLog.Information("OnDeviceAdded({0})", GetDeviceFriendlyName(deviceId));
-            return _originalOnDeviceAdded(pNotificationClient, deviceId);
+            return _config.SuppressMultimediaDeviceChangeNotificationToGame ? 0 : _originalOnDeviceAdded(pNotificationClient, deviceId);
         }
 
         private int OnDeviceRemoved(IMMNotificationClientVtbl* pNotificationClient, string deviceId) {
             PluginLog.Information("OnDeviceRemoved({0})", GetDeviceFriendlyName(deviceId));
-            return _originalOnDeviceRemoved(pNotificationClient, deviceId);
+            return _config.SuppressMultimediaDeviceChangeNotificationToGame ? 0 : _originalOnDeviceRemoved(pNotificationClient, deviceId);
         }
 
-        private int OnDefaultDeviceChanged(IMMNotificationClientVtbl* pNotificationClient, EDataFlow flow, ERole role, string defaultDeviceId) {
-            PluginLog.Information("OnDefaultDeviceChanged({0}, {1}, {2})", flow, role, GetDeviceFriendlyName(defaultDeviceId));
-            return _originalOnDefaultDeviceChanged(pNotificationClient, flow, role, defaultDeviceId);
+        private int OnDefaultDeviceChanged(IMMNotificationClientVtbl* pNotificationClient, EDataFlow flow, ERole role, string? defaultDeviceId) {
+            PluginLog.Information("OnDefaultDeviceChanged({0}, {1}, {2})", flow, role, defaultDeviceId == null ? "<null>" : GetDeviceFriendlyName(defaultDeviceId));
+
+            if (defaultDeviceId != null)
+                ResetAudioSoon(DeviceResetTriggerReason.DefaultDeviceChange);
+
+            return _config.SuppressMultimediaDeviceChangeNotificationToGame ? 0 : _originalOnDefaultDeviceChanged(pNotificationClient, flow, role, defaultDeviceId);
         }
 
         private int OnPropertyValueChanged(IMMNotificationClientVtbl* pNotificationClient, string deviceId, PropertyKey propertyKey) {
             PluginLog.Information("OnPropertyValueChanged({0}, {1})", GetDeviceFriendlyName(deviceId), PropertyKeyToName(propertyKey) ?? propertyKey.ToString());
-            if (!IGNORE_PROPERTY_KEYS.Contains(propertyKey)) {
-                if (0 > _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out var dev)) {
-                    ResetAudioNow();
-                } else {
-                    if (0 > dev.GetId(out var defaultDeviceId) || defaultDeviceId == deviceId)
-                        ResetAudioNow();
 
-                    Marshal.ReleaseComObject(dev);
-                }
+            if (IsDefaultRenderDevice(deviceId)) {
+                _propertyUpdateCount[propertyKey] = _propertyUpdateCount.GetValueOrDefault(propertyKey, 0) + 1;
+                _propertyUpdateLatest[propertyKey] = DateTime.Now;
+
+                if (!_config.IgnorePropertyUpdateKeys.Any(x => x.PropKey.Equals(propertyKey)))
+                    ResetAudioSoon(DeviceResetTriggerReason.DefaultDevicePropertyChange);
             }
-            return _originalOnPropertyValueChanged(pNotificationClient, deviceId, propertyKey);
+
+            return _config.SuppressMultimediaDeviceChangeNotificationToGame ? 0 : _originalOnPropertyValueChanged(pNotificationClient, deviceId, propertyKey);
+        }
+
+        private bool IsDefaultRenderDevice(string deviceId) {
+            IMMDevice? dev = null;
+            try {
+                _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out dev);
+                dev.GetId(out var defaultDeviceId);
+                return defaultDeviceId == deviceId;
+
+            } catch (COMException ex) {
+                if (ex.HResult == unchecked((int)0x80070490)) {
+                    // Element not found.
+                    // Happens when there does not exist a default audio endpoint.
+                    return false;
+
+                } else {
+                    PluginLog.Error(ex, "IsDefaultRenderDevice({0}): COM Error occurred", deviceId);
+                    return false;
+                }
+
+            } catch (Exception ex) {
+                PluginLog.Error(ex, "IsDefaultRenderDevice({0}): Error occurred", deviceId);
+                return false;
+
+            } finally {
+                if (dev != null)
+                    Marshal.ReleaseComObject(dev);
+            }
         }
 
         private string GetDeviceFriendlyName(string deviceId) {
-            return GetDeviceProperty<string>(deviceId, PKEY_Device_FriendlyName) ?? $"Unknown({deviceId})";
+            try {
+                return GetDeviceProperty<string>(deviceId, PKEY_Device_FriendlyName) ?? $"Unknown({deviceId})";
+            } catch (Exception ex) {
+                PluginLog.Error(ex, "GetDeviceFriendlyName({0}) failure", deviceId);
+                return $"Unknown({deviceId})";
+            }
         }
 
         private T? GetDeviceProperty<T>(string deviceId, PropertyKey propertyKey) {
@@ -249,243 +455,22 @@ namespace ResetAudio {
             }
         }
 
-        private static T? PropVariantToObject<T>(ref PropVariant propVariant) {
-            object? obj = null;
-            var pVariant = Marshal.AllocCoTaskMem(24); // sizeof(VARIANT)
-            VariantInit(pVariant);
-            if (0 <= PropVariantToVariant(ref propVariant, pVariant)) {
-                obj = Marshal.GetObjectForNativeVariant(pVariant);
-                PropVariantClear(ref propVariant);
-            }
-            VariantClear(pVariant);
-            return (T?)obj;
+        private static string FormatTimeAgo(DateTime time) {
+            var secs = (int)(DateTime.Now - time).TotalSeconds;
+            if (secs <= 0)
+                return "Now";
+            if (secs < 60)
+                return $"{secs}s ago";
+            if (secs < 60 * 60)
+                return $"{secs / 60}m ago";
+            return $"{secs / 60 / 60}h ago";
         }
 
-        private static string? PropertyKeyToName(PropertyKey propKey) {
-            if (0 > PSGetNameFromPropertyKey(ref propKey, out var ptr))
-                return null;
-
-            var name = Marshal.PtrToStringUni(ptr);
-            Marshal.FreeCoTaskMem(ptr);
-            return name;
+        private enum DeviceResetTriggerReason {
+            Unknown,
+            UserRequest,
+            DefaultDeviceChange,
+            DefaultDevicePropertyChange,
         }
-
-        private static string MainModuleRva(IntPtr ptr) {
-            return $"[ffxiv_dx11.exe+0x{(long)ptr - (long)Process.GetCurrentProcess().MainModule!.BaseAddress:X}]";
-        }
-
-#pragma warning disable 0649
-
-        private enum EDataFlow : uint {
-            eRender,
-            eCapture,
-            eAll,
-            EDataFlow_enum_count,
-        }
-
-        private enum ERole : uint {
-            eConsole,
-            eMultimedia,
-            eCommunications,
-            ERole_enum_count,
-        }
-
-        [Flags]
-        private enum AudioEndpointState : uint {
-            Active = 0x1,
-            Disabled = 0x2,
-            NotPresent = 0x4,
-            Unplugged = 0x8,
-            All = 0x0F,
-        }
-
-        private enum StorageAccessMode : uint {
-            Read,
-            Write,
-            ReadWrite,
-        }
-
-        // https://referencesource.microsoft.com/#PresentationCore/Core/CSharp/system/windows/Media/Imaging/PropVariant.cs
-        [StructLayout(LayoutKind.Sequential, Pack = 0)]
-        private struct PropArray {
-            public UInt32 cElems;
-            public IntPtr pElems;
-        }
-
-        [StructLayout(LayoutKind.Explicit, Pack = 1)]
-        private struct PropVariant {
-            [FieldOffset(0)] public ushort varType;
-            [FieldOffset(2)] public ushort wReserved1;
-            [FieldOffset(4)] public ushort wReserved2;
-            [FieldOffset(6)] public ushort wReserved3;
-
-            [FieldOffset(8)] public byte bVal;
-            [FieldOffset(8)] public sbyte cVal;
-            [FieldOffset(8)] public ushort uiVal;
-            [FieldOffset(8)] public short iVal;
-            [FieldOffset(8)] public UInt32 uintVal;
-            [FieldOffset(8)] public Int32 intVal;
-            [FieldOffset(8)] public UInt64 ulVal;
-            [FieldOffset(8)] public Int64 lVal;
-            [FieldOffset(8)] public float fltVal;
-            [FieldOffset(8)] public double dblVal;
-            [FieldOffset(8)] public short boolVal;
-            [FieldOffset(8)] public IntPtr pclsidVal; //this is for GUID ID pointer
-            [FieldOffset(8)] public IntPtr pszVal; //this is for ansi string pointer
-            [FieldOffset(8)] public IntPtr pwszVal; //this is for Unicode string pointer
-            [FieldOffset(8)] public IntPtr punkVal; //this is for punkVal (interface pointer)
-            [FieldOffset(8)] public PropArray ca;
-            [FieldOffset(8)] public System.Runtime.InteropServices.ComTypes.FILETIME filetime;
-        }
-
-        [Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IPropertyStore {
-            public int GetCount(out int propCount);
-
-            public int GetAt(int property, out PropertyKey key);
-
-            public int GetValue(ref PropertyKey key, out PropVariant value);
-
-            public int SetValue(ref PropertyKey key, ref PropVariant value);
-
-            public int Commit();
-        }
-
-        [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDevice {
-            // activationParams is a propvariant
-            public int Activate(ref Guid id, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object interfacePointer);
-
-            public int OpenPropertyStore(StorageAccessMode stgmAccess, out IPropertyStore properties);
-
-            public int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
-
-            public int GetState(out AudioEndpointState state);
-        }
-
-        [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDeviceCollection {
-            public int GetCount(out int numDevices);
-
-            public int Item(int deviceNumber, out IMMDevice device);
-        }
-
-        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IMMDeviceEnumerator {
-            public int EnumAudioEndpoints(EDataFlow dataFlow, AudioEndpointState stateMask, out IMMDeviceCollection devices);
-
-            public int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice device);
-
-            public int GetDevice(string id, out IMMDevice device);
-
-            public int RegisterEndpointNotificationCallback(void* client);
-
-            public int UnregisterEndpointNotificationCallback(void* client);
-        }
-
-        [ComImport, Guid("bcde0395-e52f-467c-8e3d-c4579291692e")]
-        private class MMDeviceEnumerator {
-        }
-
-        private delegate int OnDeviceStateChangedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId, uint dwNewState);
-        private delegate int OnDeviceAddedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId);
-        private delegate int OnDeviceRemovedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId);
-        private delegate int OnDefaultDeviceChangedDelegate(IMMNotificationClientVtbl* pNotificationClient, EDataFlow flow, ERole role, [MarshalAs(UnmanagedType.LPWStr)] string defaultDeviceId);
-        private delegate int OnPropertyValueChangedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId, PropertyKey propertyKey);
-
-        private struct PropertyKey {
-            public Guid FmtId;
-            public uint Pid;
-
-            public override string ToString() {
-                return $"PropertyKey(GUID={FmtId}, PID={Pid})";
-            }
-        }
-
-        private static PropertyKey PKEY_Device_FriendlyName = new() {
-            FmtId = new Guid(0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0),
-            Pid = 14
-        };
-
-        private struct IMMNotificationClientVtbl {
-            public IntPtr QueryInterface;
-            public IntPtr AddRef;
-            public IntPtr Release;
-            public IntPtr OnDeviceStateChanged;
-            public IntPtr OnDeviceAdded;
-            public IntPtr OnDeviceRemoved;
-            public IntPtr OnDefaultDeviceChanged;
-            public IntPtr OnPropertyValueChanged;
-        }
-
-        [Flags]
-        public enum MemoryProtection : uint {
-            PAGE_NOACCESS = 0x01,
-            PAGE_READONLY = 0x02,
-            PAGE_READWRITE = 0x04,
-            PAGE_WRITECOPY = 0x08,
-            PAGE_EXECUTE = 0x10,
-            PAGE_EXECUTE_READ = 0x20,
-            PAGE_EXECUTE_READWRITE = 0x40,
-            PAGE_GUARD = 0x100,
-            PAGE_NOCACHE = 0x200,
-            MEM_WRITECOMBINE = 0x400,
-            PAGE_TARGETS_INVALID = 0x40000000,
-            PAGE_TARGETS_NO_UPDATE = 0x40000000,
-        }
-
-        [DllImport("kernel32.dll")]
-        private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, MemoryProtection flNewProtect, out MemoryProtection lpflOldProtect);
-
-        [Flags]
-        private enum CLSCTX : uint {
-            INPROC_SERVER = 0x1,
-            INPROC_HANDLER = 0x2,
-            LOCAL_SERVER = 0x4,
-            INPROC_SERVER16 = 0x8,
-            REMOTE_SERVER = 0x10,
-            INPROC_HANDLER16 = 0x20,
-            RESERVED1 = 0x40,
-            RESERVED2 = 0x80,
-            RESERVED3 = 0x100,
-            RESERVED4 = 0x200,
-            NO_CODE_DOWNLOAD = 0x400,
-            RESERVED5 = 0x800,
-            NO_CUSTOM_MARSHAL = 0x1000,
-            ENABLE_CODE_DOWNLOAD = 0x2000,
-            NO_FAILURE_LOG = 0x4000,
-            DISABLE_AAA = 0x8000,
-            ENABLE_AAA = 0x10000,
-            FROM_DEFAULT_CONTEXT = 0x20000,
-            ACTIVATE_32_BIT_SERVER = 0x40000,
-            ACTIVATE_64_BIT_SERVER = 0x80000,
-            INPROC = INPROC_SERVER | INPROC_HANDLER,
-            SERVER = INPROC_SERVER | LOCAL_SERVER | REMOTE_SERVER,
-            ALL = SERVER | INPROC_HANDLER
-        }
-
-        [DllImport("ole32.dll")]
-        private static extern int CoCreateInstance(
-            [In, MarshalAs(UnmanagedType.LPStruct)] Guid rclsid,
-            [MarshalAs(UnmanagedType.IUnknown)] object pUnkOuter,
-            CLSCTX dwClsCtx,
-            [In, MarshalAs(UnmanagedType.LPStruct)] Guid riid,
-            [In, Out] ref IntPtr ppv);
-
-        [DllImport("Propsys.dll", SetLastError = true)]
-        private static extern int PropVariantToVariant(ref PropVariant propVariant, IntPtr pOutVariant);
-
-        [DllImport("Propsys.dll", SetLastError = true)]
-        private static extern int PSGetNameFromPropertyKey(ref PropertyKey key, out IntPtr ppszCanonicalName);
-
-        [DllImport("ole32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern int PropVariantClear(ref PropVariant propVariant);
-
-        [DllImport("oleaut32.dll", SetLastError = true)]
-        private static extern void VariantInit(IntPtr pVariant);
-
-        [DllImport("oleaut32.dll", SetLastError = true)]
-        private static extern void VariantClear(IntPtr pVariant);
-#pragma warning restore 0649
     }
 }
