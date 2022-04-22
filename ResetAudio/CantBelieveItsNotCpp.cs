@@ -1,5 +1,6 @@
 ﻿using Dalamud.Logging;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -73,11 +74,14 @@ namespace ResetAudio {
 
         [Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         public interface IPropertyStore {
-            public int GetCount(out int propCount);
+            [return: MarshalAs(UnmanagedType.I4)]
+            public int GetCount();
 
-            public int GetAt(int property, out PropertyKey key);
+            [return: MarshalAs(UnmanagedType.Struct)]
+            public PropertyKey GetAt(int property);
 
-            public int GetValue(ref PropertyKey key, out PropVariant value);
+            [return: MarshalAs(UnmanagedType.Struct)]
+            public PropVariant GetValue(ref PropertyKey key);
 
             public int SetValue(ref PropertyKey key, ref PropVariant value);
 
@@ -86,14 +90,17 @@ namespace ResetAudio {
 
         [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         public interface IMMDevice {
-            // activationParams is a propvariant
-            public int Activate(ref Guid id, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object interfacePointer);
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public object Activate([MarshalAs(UnmanagedType.LPStruct)] Guid id, CLSCTX clsCtx, IntPtr pActivationParamsPropVariant);
 
-            public int OpenPropertyStore(StorageAccessMode stgmAccess, out IPropertyStore properties);
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public IPropertyStore OpenPropertyStore(StorageAccessMode stgmAccess);
 
-            public int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+            [return: MarshalAs(UnmanagedType.LPWStr)]
+            public string GetId();
 
-            public int GetState(out AudioEndpointState state);
+            [return: MarshalAs(UnmanagedType.U4)]
+            public AudioEndpointState GetState();
         }
 
         [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -103,13 +110,16 @@ namespace ResetAudio {
             public int Item(int deviceNumber, out IMMDevice device);
         }
 
-        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         public interface IMMDeviceEnumerator {
-            public int EnumAudioEndpoints(EDataFlow dataFlow, AudioEndpointState stateMask, out IMMDeviceCollection devices);
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public IMMDeviceCollection EnumAudioEndpoints(EDataFlow dataFlow, AudioEndpointState stateMask);
 
-            public int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice device);
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public IMMDevice GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role);
 
-            public int GetDevice(string id, out IMMDevice device);
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public IMMDevice GetDevice(string id);
 
             public int RegisterEndpointNotificationCallback(void* client);
 
@@ -119,6 +129,103 @@ namespace ResetAudio {
         [ComImport, Guid("bcde0395-e52f-467c-8e3d-c4579291692e")]
         public class MMDeviceEnumerator {
         }
+
+        public enum AudioClientShareMode : uint {
+            Shared,
+            Exclusive,
+        }
+
+        [Flags]
+        public enum AudioClientStreamFlags : uint {
+            None,
+            CrossProcess = 0x00010000,
+            Loopback = 0x00020000,
+            EventCallback = 0x00040000,
+            NoPersist = 0x00080000,
+        }
+
+        public struct WaveFormatEx {
+            public ushort FormatTag;
+            public ushort Channels;
+            public uint SamplesPerSec;
+            public uint AvgBytesPerSec;
+            public ushort BlockAlign;
+            public ushort BitsPerSample;
+            public ushort cbSize;
+        }
+
+        public struct WaveFormatExtensible {
+            public static readonly ushort FormatTag_Value = 0xFFFE;
+
+            public static readonly Guid SubFormat_Pcm = new("00000001-0000-0010-8000-00aa00389b71");
+            public static readonly Guid SubFormat_Float = new("00000003-0000-0010-8000-00aa00389b71");
+
+            public ushort FormatTag;
+            public ushort Channels;
+            public uint SamplesPerSec;
+            public uint AvgBytesPerSec;
+            public ushort BlockAlign;
+            public ushort BitsPerSample;
+            public ushort cbSize;
+            public ushort ValidBitsPerSample;
+            public uint ChannelMask;
+            public Guid SubFormat;
+        }
+
+        [Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IAudioClient {
+            // REFERENCE_TIME is 64 bit int        
+
+            [PreserveSig]
+            public int Initialize(AudioClientShareMode shareMode, AudioClientStreamFlags StreamFlags, long hnsBufferDuration, long hnsPeriodicity, ref WaveFormatEx pFormat, IntPtr pAudioSessionGuid);
+
+            [return: MarshalAs(UnmanagedType.I4)]
+            public int GetBufferSize();
+
+            [return: MarshalAs(UnmanagedType.I8)]
+            public long GetStreamLatency();
+
+            [return: MarshalAs(UnmanagedType.I4)]
+            public int GetCurrentPadding();
+
+            [PreserveSig]
+            public int IsFormatSupported(AudioClientShareMode shareMode, [In] ref WaveFormatEx pFormat, [Out, Optional] out WaveFormatEx* ppClosestMatch);
+
+            public WaveFormatEx* GetMixFormat();
+
+            public int GetDevicePeriod(out long defaultDevicePeriod, out long minimumDevicePeriod);
+
+            public int Start();
+
+            public int Stop();
+
+            public int Reset();
+
+            public int SetEventHandle(IntPtr eventHandle);
+
+            [return: MarshalAs(UnmanagedType.Interface)]
+            public object GetService([MarshalAs(UnmanagedType.LPStruct)] Guid interfaceId);
+        }
+
+        [Flags]
+        public enum AudioClientBufferFlags {
+            None,
+            DataDiscontinuity = 0x1,
+            Silent = 0x2,
+            TimestampError = 0x4,
+        }
+
+        [Guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IAudioRenderClient {
+            int GetBuffer(int numFramesRequested, out IntPtr dataBufferPointer);
+
+            int ReleaseBuffer(int numFramesWritten, AudioClientBufferFlags bufferFlags);
+        }
+
+        public static readonly Guid IID_IMMDeviceEnumerator = typeof(IMMDeviceEnumerator).GUID;
+        public static readonly Guid CLSID_MMDeviceEnumerator = typeof(MMDeviceEnumerator).GUID;
+        public static readonly Guid IID_IAudioClient = typeof(IAudioClient).GUID;
+        public static readonly Guid IID_IAudioRenderClient = typeof(IAudioRenderClient).GUID;
 
         public delegate int OnDeviceStateChangedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId, uint dwNewState);
         public delegate int OnDeviceAddedDelegate(IMMNotificationClientVtbl* pNotificationClient, [MarshalAs(UnmanagedType.LPWStr)] string deviceId);
@@ -229,7 +336,7 @@ namespace ResetAudio {
         [DllImport("oleaut32.dll", SetLastError = true)]
         public static extern void VariantClear(IntPtr pVariant);
 
-        public static T? PropVariantToObject<T>(ref PropVariant propVariant) {
+        public static T? PropVariantToObjectAndFree<T>(PropVariant propVariant) {
             object? obj = null;
             var pVariant = Marshal.AllocCoTaskMem(24); // sizeof(VARIANT)
             VariantInit(pVariant);
@@ -257,7 +364,17 @@ namespace ResetAudio {
         }
 
         public static string MainModuleRva(IntPtr ptr) {
-            return $"[ffxiv_dx11.exe+0x{(long)ptr - (long)Process.GetCurrentProcess().MainModule!.BaseAddress:X}]";
+            var modules = Process.GetCurrentProcess().Modules;
+            List<ProcessModule> mh = new();
+            for (int i = 0; i < modules.Count; i++)
+                mh.Add(modules[i]);
+
+            mh.Sort((x, y) => (long)x.BaseAddress > (long)y.BaseAddress ? -1 : 1);
+            foreach (var module in mh) {
+                if ((long)module.BaseAddress <= (long)ptr)
+                    return $"[{module.ModuleName}+0x{(long)ptr - (long)module.BaseAddress:X}]";
+            }
+            return $"[0x{(long)ptr:X}]";
         }
     }
 }

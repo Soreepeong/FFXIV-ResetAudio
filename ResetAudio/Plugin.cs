@@ -2,6 +2,7 @@
 using Dalamud.Game.ClientState;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui;
+using Dalamud.Hooking;
 using Dalamud.Interface;
 using Dalamud.IoC;
 using Dalamud.Logging;
@@ -18,6 +19,7 @@ using static ResetAudio.CantBelieveItsNotCpp;
 
 namespace ResetAudio {
     public unsafe sealed class Plugin : IDalamudPlugin {
+
         // When this signature breaks, look for references to the following GUIDs in the game binary.
         // IID_IMMDeviceEnumerator: A95664D2-9614-4F35-A746-DE8DB63617E6
         // CLSID_MMDeviceEnumerator: bcde0395-e52f-467c-8e3d-c4579291692e
@@ -140,6 +142,10 @@ namespace ResetAudio {
                 commandManager.AddHandler(SlashCommand, new(OnCommand) {
                     HelpMessage = SlashCommandHelpMessage,
                 });
+
+                if (_config.Patch156e4e3)
+                    Patch156e4e3();
+
             } catch {
                 Dispose();
                 throw;
@@ -182,6 +188,57 @@ namespace ResetAudio {
             _disposableList.Clear();
         }
 
+        private delegate int GetBufferDelegate(void* pThis, int numFramesWritten, out IntPtr dataBufferPointer);
+        private delegate int ReleaseBufferDelegate(void* pThis, int numFramesWritten, AudioClientBufferFlags bufferFlags);
+
+        private Hook<GetBufferDelegate>? _getBufferHook = null;
+        private Hook<ReleaseBufferDelegate>? _releaseBufferHook = null;
+        private float* _pSamples = null;
+
+        private int GetBufferDetour(void* pThis, int numFramesWritten, out IntPtr dataBufferPointer) {
+            var res = _getBufferHook!.Original(pThis, numFramesWritten, out dataBufferPointer);
+            _pSamples = (float*)dataBufferPointer;
+            PluginLog.Information("GetBufferDetour({0:X}): {1:X}, {2:X}", (IntPtr)pThis, numFramesWritten, dataBufferPointer);
+            return res;
+        }
+
+        private int ReleaseBufferDetour(void* pThis, int numFramesWritten, AudioClientBufferFlags bufferFlags) {
+            float minv = 1, maxv = -1;
+            for (int i = 0; i < numFramesWritten * 2; i++) {
+                _pSamples[i] *= 2;
+                minv = Math.Min(minv, _pSamples[i]);
+                maxv = Math.Max(maxv, _pSamples[i]);
+            }
+            PluginLog.Information("ReleaseBufferDetour({0:X}): {1:X}, {2}: {3} ~ {4}", (IntPtr)pThis, numFramesWritten, bufferFlags, minv, maxv);
+            return _releaseBufferHook!.Original(pThis, numFramesWritten, bufferFlags);
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetEvent(IntPtr hEvent);
+        [DllImport("kernel32.dll")]
+        private static extern bool ResetEvent(IntPtr hEvent);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern UInt32 WaitForSingleObject(IntPtr hHandle, UInt32 dwMilliseconds);
+
+        private void Patch156e4e3() {
+            var addr2 = System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x156e4e3;
+            var hAudioKillSwitch = (IntPtr)Marshal.ReadInt64(System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x1ef6e40);
+            VirtualProtect(addr2, (UIntPtr)8, MemoryProtection.PAGE_EXECUTE_READWRITE, out var prevMemoryProtection);
+            try {
+                ((byte*)addr2)[0] = 0x90; // was TEST
+                ((byte*)addr2)[1] = 0x90;
+                ((byte*)addr2)[2] = 0x90; // was JNZ before along with the following byte
+                ((byte*)addr2)[3] = 0xe9;
+            } finally {
+                VirtualProtect(addr2, (UIntPtr)8, prevMemoryProtection, out _);
+            }
+
+            SetEvent(hAudioKillSwitch);
+        }
+
         private void DrawUI() {
             if (!_config.ConfigVisible)
                 return;
@@ -214,6 +271,7 @@ namespace ResetAudio {
                     var changed = false;
                     changed |= ImGui.Checkbox("Log audio reset notice message to default log channel", ref _config.PrintAudioResetToChat);
                     changed |= ImGui.Checkbox("Show advanced configuration", ref _config.AdvanceConfigExpanded);
+
                     if (_config.AdvanceConfigExpanded) {
                         ImGuiHelpers.ScaledDummy(10);
 
@@ -298,6 +356,78 @@ namespace ResetAudio {
                             }
 
                             ImGui.EndTable();
+                        }
+
+                        ImGuiHelpers.ScaledDummy(10);
+
+                        if (ImGui.CollapsingHeader("Random Testing Options")) {
+                            if (ImGui.Button("Log all buffer requests")) {
+                                var t = _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole);
+                                var iid = IID_IAudioClient;
+                                var aclient = (IAudioClient)t.Activate(IID_IAudioClient, CLSCTX.ALL, IntPtr.Zero);
+                                var mf = aclient.GetMixFormat();
+                                aclient.Initialize(AudioClientShareMode.Shared, AudioClientStreamFlags.None, 100000000, 0, ref *mf, IntPtr.Zero);
+                                var arclient = (IAudioRenderClient)aclient.GetService(IID_IAudioRenderClient);
+
+                                var arcadr = (IntPtr*)*((IntPtr*)Marshal.GetComInterfaceForObject<IAudioRenderClient, IAudioRenderClient>(arclient));
+                                PluginLog.Information("IAudioRenderClient.QueryInterface: {0}", MainModuleRva(arcadr[0])); // QueryInterface
+                                PluginLog.Information("IAudioRenderClient.AddRef: {0}", MainModuleRva(arcadr[1])); // AddRef
+                                PluginLog.Information("IAudioRenderClient.Release: {0}", MainModuleRva(arcadr[2])); // Release
+                                PluginLog.Information("IAudioRenderClient.GetBuffer: {0}", MainModuleRva(arcadr[3])); // GetBuffer
+                                PluginLog.Information("IAudioRenderClient.ReleaseBuffer: {0}", MainModuleRva(arcadr[4])); // ReleaseBuffer
+
+                                if (_getBufferHook != null) {
+                                    _getBufferHook.Dispose();
+                                    _disposableList.Remove(_getBufferHook);
+                                    _getBufferHook = null;
+                                } else {
+                                    _disposableList.Add(_getBufferHook = new Hook<GetBufferDelegate>(arcadr[3], GetBufferDetour));
+                                    _getBufferHook.Enable();
+                                }
+
+                                if (_releaseBufferHook != null) {
+                                    _releaseBufferHook.Dispose();
+                                    _disposableList.Remove(_releaseBufferHook);
+                                    _releaseBufferHook = null;
+                                } else {
+                                    _disposableList.Add(_releaseBufferHook = new Hook<ReleaseBufferDelegate>(arcadr[4], ReleaseBufferDetour));
+                                    _releaseBufferHook.Enable();
+                                }
+
+                                PluginLog.Information("FormatTag: {0}", mf->FormatTag);
+                                PluginLog.Information("Channel: {0}", mf->Channels);
+                                PluginLog.Information("SamplesPerSec: {0}", mf->SamplesPerSec);
+                                PluginLog.Information("AvgBytesPerSec: {0}", mf->AvgBytesPerSec);
+                                PluginLog.Information("BlockAlign: {0}", mf->BlockAlign);
+                                PluginLog.Information("BitsPerSample: {0}", mf->BitsPerSample);
+                                PluginLog.Information("cbSize: {0}", mf->cbSize);
+                                if (mf->FormatTag == WaveFormatExtensible.FormatTag_Value) {
+                                    var mfext = (WaveFormatExtensible*)mf;
+                                    PluginLog.Information("ValidBitsPerSample: {0}", mfext->ValidBitsPerSample);
+                                    PluginLog.Information("ChannelMask: {0}", mfext->ChannelMask);
+                                    PluginLog.Information("SubFormat: {0}", mfext->SubFormat);
+                                }
+                                Marshal.FreeCoTaskMem((IntPtr)mf);
+                                Marshal.ReleaseComObject(arclient);
+                                Marshal.ReleaseComObject(aclient);
+                                Marshal.ReleaseComObject(t);
+                            }
+
+                            var addr2 = System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x156e4e3;
+                            changed |= ImGui.Checkbox("Patch +156e4e3 on startup", ref _config.Patch156e4e3);
+                            if (((byte*)addr2)[0] == 0x90)
+                                ImGui.Text("+156e4e3 Patched");
+                            else if (ImGui.Button("Patch +156e4e3 to uncond jump so that the audio thread never exits"))
+                                Patch156e4e3();
+
+                            var hAudioKillSwitch = (IntPtr)Marshal.ReadInt64(System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x1ef6e40);
+                            ImGui.TextUnformatted($"KillSwitch Event(0x{hAudioKillSwitch:X}): {(WaitForSingleObject(hAudioKillSwitch, 0) != 0 ? "Not Set" : "Set")}");
+                            ImGui.SameLine();
+                            if (ImGui.Button("SetEvent"))
+                                PluginLog.Information("SetEvent(0x{0:X}): {1}", hAudioKillSwitch, SetEvent(hAudioKillSwitch));
+                            ImGui.SameLine();
+                            if (ImGui.Button("ResetEvent"))
+                                PluginLog.Information("ResetEvent(0x{0:X}): {1}", hAudioKillSwitch, ResetEvent(hAudioKillSwitch));
                         }
                     }
 
@@ -402,9 +532,8 @@ namespace ResetAudio {
         private bool IsDefaultRenderDevice(string deviceId) {
             IMMDevice? dev = null;
             try {
-                _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out dev);
-                dev.GetId(out var defaultDeviceId);
-                return defaultDeviceId == deviceId;
+                dev = _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole);
+                return dev.GetId() == deviceId;
 
             } catch (COMException ex) {
                 if (ex.HResult == unchecked((int)0x80070490)) {
@@ -437,16 +566,11 @@ namespace ResetAudio {
         }
 
         private T? GetDeviceProperty<T>(string deviceId, PropertyKey propertyKey) {
-            if (0 > _pDeviceEnumerator.GetDevice(deviceId, out var device))
-                return default(T);
+            var device = _pDeviceEnumerator.GetDevice(deviceId);
             try {
-                if (0 > device.OpenPropertyStore(StorageAccessMode.Read, out var properties))
-                    return default(T);
+                var properties = device.OpenPropertyStore(StorageAccessMode.Read);
                 try {
-                    if (0 > properties.GetValue(ref propertyKey, out var propVariant))
-                        return default(T);
-
-                    return PropVariantToObject<T>(ref propVariant);
+                    return PropVariantToObjectAndFree<T>(properties.GetValue(ref propertyKey));
                 } finally {
                     Marshal.ReleaseComObject(properties);
                 }

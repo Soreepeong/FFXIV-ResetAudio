@@ -18,6 +18,8 @@ namespace ResetAudio {
 
         public bool PrintAudioResetToChat = true;
 
+        public bool Patch156e4e3 = true;
+
         public int CoalesceAudioResetRequestDurationMs = 100;
 
         public List<PropertyKeyWithComment> IgnorePropertyUpdateKeys = new();
