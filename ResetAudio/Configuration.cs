@@ -18,7 +18,7 @@ namespace ResetAudio {
 
         public bool PrintAudioResetToChat = true;
 
-        public bool Patch156e4e3 = true;
+        public bool EnableOrchestrionIntegration = true;
 
         public int CoalesceAudioResetRequestDurationMs = 100;
 

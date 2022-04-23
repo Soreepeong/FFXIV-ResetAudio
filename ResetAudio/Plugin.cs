@@ -7,6 +7,8 @@ using Dalamud.Interface;
 using Dalamud.IoC;
 using Dalamud.Logging;
 using Dalamud.Plugin;
+using Dalamud.Plugin.Ipc;
+using Dalamud.Plugin.Ipc.Exceptions;
 using ImGuiNET;
 using System;
 using System.Collections.Generic;
@@ -19,45 +21,126 @@ using static ResetAudio.CantBelieveItsNotCpp;
 
 namespace ResetAudio {
     public unsafe sealed class Plugin : IDalamudPlugin {
+        private class MemorySignatures {
+            // When this signature breaks, look for references to the following GUIDs in the game binary.
+            // IID_IMMDeviceEnumerator: A95664D2-9614-4F35-A746-DE8DB63617E6
+            // CLSID_MMDeviceEnumerator: bcde0395-e52f-467c-8e3d-c4579291692e
+            internal static readonly string XivAudioEnumerator_Initialize = string.Join(' ', new string[]{
+                // Function preamble
+                /* 0x00 */ "48 89 5c 24 ??"             , // MOV [rsp+0x08], rbx
+                /* 0x05 */ "48 89 74 24 ??"             , // MOV [rsp+0x10], rsi
+                /* 0x0A */ "57"                         , // PUSH rdi
+                /* 0x0B */ "48 83 ec ??"                , // SUB rsp, 0x30
 
-        // When this signature breaks, look for references to the following GUIDs in the game binary.
-        // IID_IMMDeviceEnumerator: A95664D2-9614-4F35-A746-DE8DB63617E6
-        // CLSID_MMDeviceEnumerator: bcde0395-e52f-467c-8e3d-c4579291692e
-        private static readonly string XIV_AUDIO_ENUMERATOR_INITIALIZE_SIGNATURE = string.Join(' ', new string[]{
-            // Function preamble
-            /* 0x00 */ "48 89 5c 24 ??"             , // MOV [rsp+0x08], rbx
-            /* 0x05 */ "48 89 74 24 ??"             , // MOV [rsp+0x10], rsi
-            /* 0x0A */ "57"                         , // PUSH rdi
-            /* 0x0B */ "48 83 ec ??"                , // SUB rsp, 0x30
+                // Save parameter 1 (rcx) to rbx
+                // parameter 1: class containing audio enumeration stuff
+                /* 0x0F */ "48 8b d9"                   , // MOV rbx, rcx
 
-            // Save parameter 1 (rcx) to rbx
-            // parameter 1: class containing audio enumeration stuff
-            /* 0x0F */ "48 8b d9"                   , // MOV rbx, rcx
+                // Call a function that does nothing more than to do the following:
+                // 1. MOV rax, rcx
+                // 2. RET
+                /* 0x12 */ "e8 ?? ?? ?? ??"             , // CALL ffxiv_dx11.exe+0x0155CEF0
 
-            // Call a function that does nothing more than to do the following:
-            // 1. MOV rax, rcx
-            // 2. RET
-            /* 0x12 */ "e8 ?? ?? ?? ??"             , // CALL ffxiv_dx11.exe+0x0155CEF0
+                // Anything marked as <x> can be placed anywhere below.
+                /* 0x17 */ "48 8d 05 ?? ?? ?? ??"       , // LEA rax, [ffxiv_dx11.exe+0x01ACCBA0]     // <1>
+                /* 0x1E */ "48 c7 43 ?? 00 00 00 00"    , // MOV [rbx+0x10], 0x00000000               // <x> Initialize pIMMNotificationClient to nullptr
+                /* 0x26 */ "48 89 03"                   , // MOV [rbx], rax                           // <1> Assign probably-destructor
+                /* 0x29 */ "48 8d 4b ??"                , // LEA rcx, [rbx+0x10]                      // <x> 
+                /* 0x2D */ "48 8d 05 ?? ?? ?? ??"       , // LEA rax, [ffxiv_dx11.exe+0x01ACCBA8]     // <2> This contains the value we want.
+                /* 0x34 */ "48 89 43 ??"                , // MOV [rbx+0x08], rax                      // <2> Assign IMMNotificationClientVtbl
+            });
 
-            // Anything marked as <x> can be placed anywhere below.
-            /* 0x17 */ "48 8d 05 ?? ?? ?? ??"       , // LEA rax, [ffxiv_dx11.exe+0x01ACCBA0]     // <1>
-            /* 0x1E */ "48 c7 43 ?? 00 00 00 00"    , // MOV [rbx+0x10], 0x00000000               // <x> Initialize pIMMNotificationClient to nullptr
-            /* 0x26 */ "48 89 03"                   , // MOV [rbx], rax                           // <1> Assign probably-destructor
-            /* 0x29 */ "48 8d 4b ??"                , // LEA rcx, [rbx+0x10]                      // <x> 
-            /* 0x2D */ "48 8d 05 ?? ?? ?? ??"       , // LEA rax, [ffxiv_dx11.exe+0x01ACCBA8]     // <2> This contains the value we want.
-            /* 0x34 */ "48 89 43 ??"                , // MOV [rbx+0x08], rax                      // <2> Assign IMMNotificationClientVtbl
-        });
+            internal static readonly string AudioRenderClientThreadBody = string.Join(' ', new string[]{
+                // Function preamble
+                /* 0x00 */ "40 56"                      , // PUSH rsi
+                /* 0x02 */ "41 57"                      , // PUSH r15
+                /* 0x04 */ "48 81 ec ?? ?? ?? ??"       , // SUB rsp, 0x000000A8
+            
+                // Stack guard
+                /* 0x0B */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF5AB0]
+                /* 0x12 */ "48 33 c4"                   , // XOR rax, rsp
+                /* 0x15 */ "48 89 44 24 ??"             , // MOV [rsp+0x44], rax
+
+                // CoInitializeEx(0, 0)
+                /* 0x1A */ "33 d2"                      , // XOR edx, edx
+                /* 0x1C */ "33 c9"                      , // XOR ecx, ecx
+                /* 0x1E */ "40 32 f6"                   , // XOR sil, sil
+                /* 0x21 */ "ff 15 ?? ?? ?? ??"          , // CALL CoInitializeEx
+            
+                // The event handle we want, which gets set on exit request.
+                /* 0x27 */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF6E40]
+            });
+
+            internal static readonly string MainAudioClass_Construct = string.Join(' ', new string[] {
+                "48 89 5c 24 ??"                        , // MOV [rsp+0x08], rbx
+                "48 89 6c 24 ??"                        , // MOV [rsp+0x10], rbp
+                "48 89 74 24 ??"                        , // MOV [rsp+0x18], rsi
+                "57"                                    , // PUSH rdi
+                "41 56"                                 , // PUSH r14
+                "41 57"                                 , // PUSH r15
+                "48 83 ec ??"                           , // SUB rsp, 0x20
+                "41 0f b6 f8"                           , // MOVZX edi, r8l
+                "0f b6 f2"                              , // MOVZX esi, dl
+                "4c 8b f1"                              , // MOV r14, rcx
+            });
+
+            internal static readonly string MainAudioClass_Initialize = string.Join(' ', new string[] {
+                "48 89 5c 24 ??"                        , // MOV [rsp+0x10], rbx
+                "55"                                    , // PUSH rbp
+                "56"                                    , // PUSH rsi
+                "57"                                    , // PUSH rdi
+                "41 56"                                 , // PUSH r14
+                "41 57"                                 , // PUSH r15
+                "48 8d ac 24 ?? ?? ?? ??"               , // LEA rbp, [rsp-0x4f0]
+                "48 81 ec ?? ?? ?? ??"                  , // SUB rsp, 0x5f0
+                "48 8b 05 ?? ?? ?? ??"                  , // MOV rax, [ffxiv_dx11.exe+0x1EF5AB0]
+                "48 33 c4"                              , // XOR rax, rsp
+                "48 89 85 ?? ?? ?? ??"                  , // MOV [rbp+0x4e0], rax
+                "48 8b 05 ?? ?? ?? ??"                  , // MOV rax, [ffxiv_dx11.exe+0x1F12FD8]
+                "4d 8b c8"                              , // MOV r9, r8
+                "0f b6 f2"                              , // MOVZX esi, dl
+            });
+
+            internal static readonly string MainAudioClass_Cleanup = string.Join(' ', new string[] {
+                "48 89 5c 24 ??"                        , // MOV [rsp+0x08], rbx
+                "48 89 6c 24 ??"                        , // MOV [rsp+0x10], rbp
+                "48 89 74 24 ??"                        , // MOV [rsp+0x18], rsi
+                "57"                                    , // PUSH rdi
+                "48 83 ec ??"                           , // SUB rsp, 0x20
+                "48 8b f1"                              , // MOV rci, rcx
+                "33 ed"                                 , // XOR ebp, ebp
+                "48 8b 89 ?? ?? ?? ??"                  , // MOV rcx, [rcx+0x288]
+                "48 85 c9"                              , // TEST rcx, rcx
+            });
+
+            internal static readonly string MainAudioClass_SetStaticAddr2 = string.Join(' ', new string[] {
+                "48 89 5c 24 ??"                        , // MOV [rsp+0x08], rbx
+                "57"                                    , // PUSH rdi
+                "48 83 ec ??"                           , // SUB rsp, 0x20
+                "33 d2"                                 , // XOR edx, edx
+                "48 8b f9"                              , // XOR rdi, rcx
+                "45 33 c0"                              , // XOR r8d, r8d
+                "8d 4a ??"                              , // LEA ecx, [rdx+0x30]
+                "e8 ?? ?? ?? ??"                        , // CALL ffxiv_dx11.exe+0x60c80
+                "48 8b d8"                              , // MOV rbx, rax
+                "48 85 c0"                              , // TEST rax, rax
+                "74 ??"                                 , // JE +0x22
+                "48 8d 48 ??"                           , // LEA rcx, [rax+0x08]
+                "ff 15 ?? ?? ?? ??"                     , // CALL ntdll.RtlInitializeCriticalSection
+            });
+        }
 
         public string Name => "Reset Audio";
         private readonly string SlashCommand = "/resetaudio";
-        private readonly string SlashCommandHelpMessage = "Manually trigger game audio reset.\n* /resetaudio (r|reset): Reset audio right now.\n* /resetaudio c|configure: Open ResetAudio configuration window.\n* /resetaudio h|help: Print help message.";
+        private readonly string SlashCommandHelpMessage = "Manually trigger game audio reset.\n* /resetaudio (r|reset): Reset audio right now.\n* /resetaudio (h|harder): Completely reloads audio.\n* /resetaudio c|configure: Open ResetAudio configuration window.\n* /resetaudio h|help: Print help message.";
 
         private readonly DalamudPluginInterface _pluginInterface;
         private readonly CommandManager _commandManager;
         private readonly ChatGui _chatGui;
+        private readonly Framework _framework;
         private readonly Configuration _config;
 
-        private readonly List<IDisposable> _disposableList = new();
+        private readonly List<Tuple<IDisposable?, Action?>> _disposableList = new();
         private readonly CancellationTokenSource _disposeToken;
 
         private readonly IMMDeviceEnumerator _pDeviceEnumerator;
@@ -66,6 +149,7 @@ namespace ResetAudio {
         private readonly IMMNotificationClientVtbl _notificationClientVtblOriginalValue;
 
         private readonly bool* _resetAudio;
+        private readonly ICallGateSubscriber<int, bool> _orchPlaySong;
 
         private readonly OnDeviceStateChangedDelegate _originalOnDeviceStateChanged;
         private readonly OnDeviceAddedDelegate _originalOnDeviceAdded;
@@ -82,6 +166,22 @@ namespace ResetAudio {
         private readonly Dictionary<PropertyKey, int> _propertyUpdateCount = new();
         private readonly Dictionary<PropertyKey, DateTime> _propertyUpdateLatest = new();
 
+        private DateTime? ReconstructAudioNextActionTimestamp = null;
+        private int ReconstructAudioStep = 0;
+
+        private IntPtr* _phAudioRenderClientThreadExitEvent;
+        private IntPtr** _ppMainAudioClass;
+
+        private delegate IntPtr MainAudioClass_Cleanup(IntPtr pThis);
+        private delegate IntPtr MainAudioClass_Construct(IntPtr pThis, bool p0, bool p1);
+        private delegate IntPtr MainAudioClass_Initialize(IntPtr pThis, bool p0, IntPtr pszAudioConfigString);
+        private delegate IntPtr MainAudioClass_SetStaticAddr2(IntPtr pThis);
+
+        private MainAudioClass_Cleanup _pfnMainAudioClass_Cleanup;
+        private MainAudioClass_Construct _pfnMainAudioClass_Construct;
+        private MainAudioClass_Initialize _pfnMainAudioClass_Initialize;
+        private MainAudioClass_SetStaticAddr2 _pfnMainAudioClass_SetStaticAddr2;
+
         private Task? _resetAudioSoonTask;
 
         public Plugin(
@@ -89,13 +189,15 @@ namespace ResetAudio {
             [RequiredVersion("1.0")] CommandManager commandManager,
             [RequiredVersion("1.0")] ClientState clientState,
             [RequiredVersion("1.0")] ChatGui chatGui,
+            [RequiredVersion("1.0")] Framework framework,
             [RequiredVersion("1.0")] SigScanner sigScanner) {
             try {
                 _pluginInterface = pluginInterface;
                 _commandManager = commandManager;
                 _chatGui = chatGui;
+                _framework = framework;
 
-                _disposableList.Add(_disposeToken = new());
+                _disposableList.Add(Tuple.Create<IDisposable?, Action?>(_disposeToken = new(), null));
 
                 _config = _pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
                 _config.Initialize(_pluginInterface);
@@ -103,14 +205,43 @@ namespace ResetAudio {
                 _pluginInterface.UiBuilder.Draw += DrawUI;
                 _pluginInterface.UiBuilder.OpenConfigUi += () => { _config.ConfigVisible = !_config.ConfigVisible; };
 
-                var pInitXivAudioEnumerator = sigScanner.ScanText(XIV_AUDIO_ENUMERATOR_INITIALIZE_SIGNATURE);
-                var pOpBase = pInitXivAudioEnumerator + 0x34;
-                var pAddrDelta = Marshal.ReadInt32(pInitXivAudioEnumerator + 0x2D + 0x03);
-                var pVtbl = pOpBase + pAddrDelta;
-                _pNotificationClientVtbl = (IMMNotificationClientVtbl*)pVtbl;
+                _orchPlaySong = _pluginInterface.GetIpcSubscriber<int, bool>("Orch.PlaySong");
+
+                _framework.Update += OnFrameworkUpdate;
+                _disposableList.Add(Tuple.Create<IDisposable?, Action?>(null, () => { _framework.Update -= OnFrameworkUpdate; }));
+
+                var pAudioRenderClientThreadBody = sigScanner.ScanText(MemorySignatures.AudioRenderClientThreadBody);
+                var pOpBase = pAudioRenderClientThreadBody + 0x2E;
+                _phAudioRenderClientThreadExitEvent = (IntPtr*)(pOpBase + Marshal.ReadInt32(pOpBase - 0x04));
+                PluginLog.Verbose($"phAudioRenderClientThreadExitEvent: {MainModuleRva((IntPtr)_phAudioRenderClientThreadExitEvent)}");
+
+                var pfn = sigScanner.ScanText(MemorySignatures.MainAudioClass_Construct);
+                _pfnMainAudioClass_Construct = Marshal.GetDelegateForFunctionPointer<MainAudioClass_Construct>(pfn);
+                PluginLog.Verbose($"MainAudioClass_Construct: {MainModuleRva(pfn)}");
+
+                pfn = sigScanner.ScanText(MemorySignatures.MainAudioClass_Initialize);
+                _pfnMainAudioClass_Initialize = Marshal.GetDelegateForFunctionPointer<MainAudioClass_Initialize>(pfn);
+                PluginLog.Verbose($"MainAudioClass_Initialize: {MainModuleRva(pfn)}");
+
+                pfn = sigScanner.ScanText(MemorySignatures.MainAudioClass_Cleanup);
+                _pfnMainAudioClass_Cleanup = Marshal.GetDelegateForFunctionPointer<MainAudioClass_Cleanup>(pfn);
+                PluginLog.Verbose($"MainAudioClass_Cleanup: {MainModuleRva(pfn)}");
+
+                pfn = sigScanner.ScanText(MemorySignatures.MainAudioClass_SetStaticAddr2);
+                _pfnMainAudioClass_SetStaticAddr2 = Marshal.GetDelegateForFunctionPointer<MainAudioClass_SetStaticAddr2>(pfn);
+                PluginLog.Verbose($"MainAudioClass_SetStaticAddr2: {MainModuleRva(pfn)}");
+                pOpBase = pfn + 0x39;
+                _ppMainAudioClass = (IntPtr**)(pOpBase + Marshal.ReadInt32(pOpBase - 0x04));
+                PluginLog.Verbose($"ppMainAudioClass: {MainModuleRva((IntPtr)_ppMainAudioClass)}");
+                PluginLog.Verbose($"*ppMainAudioClass: {MainModuleRva((IntPtr)(*_ppMainAudioClass))}");
+                PluginLog.Verbose($"**ppMainAudioClass: {MainModuleRva(**_ppMainAudioClass)}");
+
+                var pInitXivAudioEnumerator = sigScanner.ScanText(MemorySignatures.XivAudioEnumerator_Initialize);
+                pOpBase = pInitXivAudioEnumerator + 0x34;
+                _pNotificationClientVtbl = (IMMNotificationClientVtbl*)(pOpBase + Marshal.ReadInt32(pOpBase - 0x04));
                 _notificationClientVtblOriginalValue = *_pNotificationClientVtbl;
 
-                PluginLog.Verbose($"IMMNotificationClientVtbl: {MainModuleRva(pVtbl)}");
+                PluginLog.Verbose($"IMMNotificationClientVtbl: {MainModuleRva((IntPtr)_pNotificationClientVtbl)}");
                 PluginLog.Verbose($"OnDeviceStateChanged: {MainModuleRva(_pNotificationClientVtbl->OnDeviceStateChanged)}");
                 PluginLog.Verbose($"OnDeviceAdded: {MainModuleRva(_pNotificationClientVtbl->OnDeviceAdded)}");
                 PluginLog.Verbose($"OnDeviceRemoved: {MainModuleRva(_pNotificationClientVtbl->OnDeviceRemoved)}");
@@ -128,7 +259,7 @@ namespace ResetAudio {
 
                 PluginLog.Log($"ResetAudio Byte: {MainModuleRva((IntPtr)_resetAudio)}");
 
-                VirtualProtect(pVtbl, (UIntPtr)Marshal.SizeOf<IMMNotificationClientVtbl>(), MemoryProtection.PAGE_READWRITE, out var prevMemoryProtection);
+                VirtualProtect((IntPtr)_pNotificationClientVtbl, (UIntPtr)Marshal.SizeOf<IMMNotificationClientVtbl>(), MemoryProtection.PAGE_READWRITE, out var prevMemoryProtection);
                 try {
                     _pNotificationClientVtbl->OnDeviceStateChanged = Marshal.GetFunctionPointerForDelegate(_newOnDeviceStateChanged = new(OnDeviceStateChanged));
                     _pNotificationClientVtbl->OnDeviceAdded = Marshal.GetFunctionPointerForDelegate(_newOnDeviceAdded = new(OnDeviceAdded));
@@ -136,15 +267,12 @@ namespace ResetAudio {
                     _pNotificationClientVtbl->OnDefaultDeviceChanged = Marshal.GetFunctionPointerForDelegate(_newOnDefaultDeviceChanged = new(OnDefaultDeviceChanged));
                     _pNotificationClientVtbl->OnPropertyValueChanged = Marshal.GetFunctionPointerForDelegate(_newOnPropertyValueChanged = new(OnPropertyValueChanged));
                 } finally {
-                    VirtualProtect(pVtbl, (UIntPtr)Marshal.SizeOf<IMMNotificationClientVtbl>(), prevMemoryProtection, out _);
+                    VirtualProtect((IntPtr)_pNotificationClientVtbl, (UIntPtr)Marshal.SizeOf<IMMNotificationClientVtbl>(), prevMemoryProtection, out _);
                 }
 
                 commandManager.AddHandler(SlashCommand, new(OnCommand) {
                     HelpMessage = SlashCommandHelpMessage,
                 });
-
-                if (_config.Patch156e4e3)
-                    Patch156e4e3();
 
             } catch {
                 Dispose();
@@ -180,7 +308,8 @@ namespace ResetAudio {
 
             foreach (var item in _disposableList.AsEnumerable().Reverse()) {
                 try {
-                    item.Dispose();
+                    item.Item1?.Dispose();
+                    item.Item2?.Invoke();
                 } catch (Exception e) {
                     PluginLog.Warning(e, "{0}: Dispose failure", item);
                 }
@@ -213,32 +342,6 @@ namespace ResetAudio {
             return _releaseBufferHook!.Original(pThis, numFramesWritten, bufferFlags);
         }
 
-        [DllImport("kernel32.dll")]
-        private static extern bool SetEvent(IntPtr hEvent);
-        [DllImport("kernel32.dll")]
-        private static extern bool ResetEvent(IntPtr hEvent);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr hObject);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern UInt32 WaitForSingleObject(IntPtr hHandle, UInt32 dwMilliseconds);
-
-        private void Patch156e4e3() {
-            var addr2 = System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x156e4e3;
-            var hAudioKillSwitch = (IntPtr)Marshal.ReadInt64(System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x1ef6e40);
-            VirtualProtect(addr2, (UIntPtr)8, MemoryProtection.PAGE_EXECUTE_READWRITE, out var prevMemoryProtection);
-            try {
-                ((byte*)addr2)[0] = 0x90; // was TEST
-                ((byte*)addr2)[1] = 0x90;
-                ((byte*)addr2)[2] = 0x90; // was JNZ before along with the following byte
-                ((byte*)addr2)[3] = 0xe9;
-            } finally {
-                VirtualProtect(addr2, (UIntPtr)8, prevMemoryProtection, out _);
-            }
-
-            SetEvent(hAudioKillSwitch);
-        }
-
         private void DrawUI() {
             if (!_config.ConfigVisible)
                 return;
@@ -252,7 +355,7 @@ namespace ResetAudio {
                 ImGui.SetNextWindowSize(windowSize, ImGuiCond.Once);
 
             } else {
-                windowSize = new Vector2(450, 135) * scale;
+                windowSize = new Vector2(500, 155) * scale;
                 ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, windowSize);
                 ImGui.SetNextWindowSize(windowSize, ImGuiCond.Always);
                 windowFlags |= ImGuiWindowFlags.NoResize;
@@ -266,6 +369,12 @@ namespace ResetAudio {
                     ImGui.SameLine();
                     ImGui.TextUnformatted("Use /resetaudio to invoke it as a text command.");
 
+                    if (ImGui.Button("Try Harder"))
+                        ReconstructAudio();
+
+                    ImGui.SameLine();
+                    ImGui.TextUnformatted("This may crash, and restarting after this is still recommended.");
+
                     ImGuiHelpers.ScaledDummy(10);
 
                     var changed = false;
@@ -275,6 +384,7 @@ namespace ResetAudio {
                     if (_config.AdvanceConfigExpanded) {
                         ImGuiHelpers.ScaledDummy(10);
 
+                        changed |= ImGui.Checkbox("Orchestrion Integration", ref _config.EnableOrchestrionIntegration);
                         changed |= ImGui.Checkbox("Do not relay audio device change notification to game", ref _config.SuppressMultimediaDeviceChangeNotificationToGame);
                         changed |= ImGui.SliderInt("Merge audio reset requests (ms)", ref _config.CoalesceAudioResetRequestDurationMs, 50, 1000);
 
@@ -357,78 +467,6 @@ namespace ResetAudio {
 
                             ImGui.EndTable();
                         }
-
-                        ImGuiHelpers.ScaledDummy(10);
-
-                        if (ImGui.CollapsingHeader("Random Testing Options")) {
-                            if (ImGui.Button("Log all buffer requests")) {
-                                var t = _pDeviceEnumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole);
-                                var iid = IID_IAudioClient;
-                                var aclient = (IAudioClient)t.Activate(IID_IAudioClient, CLSCTX.ALL, IntPtr.Zero);
-                                var mf = aclient.GetMixFormat();
-                                aclient.Initialize(AudioClientShareMode.Shared, AudioClientStreamFlags.None, 100000000, 0, ref *mf, IntPtr.Zero);
-                                var arclient = (IAudioRenderClient)aclient.GetService(IID_IAudioRenderClient);
-
-                                var arcadr = (IntPtr*)*((IntPtr*)Marshal.GetComInterfaceForObject<IAudioRenderClient, IAudioRenderClient>(arclient));
-                                PluginLog.Information("IAudioRenderClient.QueryInterface: {0}", MainModuleRva(arcadr[0])); // QueryInterface
-                                PluginLog.Information("IAudioRenderClient.AddRef: {0}", MainModuleRva(arcadr[1])); // AddRef
-                                PluginLog.Information("IAudioRenderClient.Release: {0}", MainModuleRva(arcadr[2])); // Release
-                                PluginLog.Information("IAudioRenderClient.GetBuffer: {0}", MainModuleRva(arcadr[3])); // GetBuffer
-                                PluginLog.Information("IAudioRenderClient.ReleaseBuffer: {0}", MainModuleRva(arcadr[4])); // ReleaseBuffer
-
-                                if (_getBufferHook != null) {
-                                    _getBufferHook.Dispose();
-                                    _disposableList.Remove(_getBufferHook);
-                                    _getBufferHook = null;
-                                } else {
-                                    _disposableList.Add(_getBufferHook = new Hook<GetBufferDelegate>(arcadr[3], GetBufferDetour));
-                                    _getBufferHook.Enable();
-                                }
-
-                                if (_releaseBufferHook != null) {
-                                    _releaseBufferHook.Dispose();
-                                    _disposableList.Remove(_releaseBufferHook);
-                                    _releaseBufferHook = null;
-                                } else {
-                                    _disposableList.Add(_releaseBufferHook = new Hook<ReleaseBufferDelegate>(arcadr[4], ReleaseBufferDetour));
-                                    _releaseBufferHook.Enable();
-                                }
-
-                                PluginLog.Information("FormatTag: {0}", mf->FormatTag);
-                                PluginLog.Information("Channel: {0}", mf->Channels);
-                                PluginLog.Information("SamplesPerSec: {0}", mf->SamplesPerSec);
-                                PluginLog.Information("AvgBytesPerSec: {0}", mf->AvgBytesPerSec);
-                                PluginLog.Information("BlockAlign: {0}", mf->BlockAlign);
-                                PluginLog.Information("BitsPerSample: {0}", mf->BitsPerSample);
-                                PluginLog.Information("cbSize: {0}", mf->cbSize);
-                                if (mf->FormatTag == WaveFormatExtensible.FormatTag_Value) {
-                                    var mfext = (WaveFormatExtensible*)mf;
-                                    PluginLog.Information("ValidBitsPerSample: {0}", mfext->ValidBitsPerSample);
-                                    PluginLog.Information("ChannelMask: {0}", mfext->ChannelMask);
-                                    PluginLog.Information("SubFormat: {0}", mfext->SubFormat);
-                                }
-                                Marshal.FreeCoTaskMem((IntPtr)mf);
-                                Marshal.ReleaseComObject(arclient);
-                                Marshal.ReleaseComObject(aclient);
-                                Marshal.ReleaseComObject(t);
-                            }
-
-                            var addr2 = System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x156e4e3;
-                            changed |= ImGui.Checkbox("Patch +156e4e3 on startup", ref _config.Patch156e4e3);
-                            if (((byte*)addr2)[0] == 0x90)
-                                ImGui.Text("+156e4e3 Patched");
-                            else if (ImGui.Button("Patch +156e4e3 to uncond jump so that the audio thread never exits"))
-                                Patch156e4e3();
-
-                            var hAudioKillSwitch = (IntPtr)Marshal.ReadInt64(System.Diagnostics.Process.GetCurrentProcess().MainModule!.BaseAddress + 0x1ef6e40);
-                            ImGui.TextUnformatted($"KillSwitch Event(0x{hAudioKillSwitch:X}): {(WaitForSingleObject(hAudioKillSwitch, 0) != 0 ? "Not Set" : "Set")}");
-                            ImGui.SameLine();
-                            if (ImGui.Button("SetEvent"))
-                                PluginLog.Information("SetEvent(0x{0:X}): {1}", hAudioKillSwitch, SetEvent(hAudioKillSwitch));
-                            ImGui.SameLine();
-                            if (ImGui.Button("ResetEvent"))
-                                PluginLog.Information("ResetEvent(0x{0:X}): {1}", hAudioKillSwitch, ResetEvent(hAudioKillSwitch));
-                        }
                     }
 
                     if (changed)
@@ -439,6 +477,70 @@ namespace ResetAudio {
             }
 
             ImGui.PopStyleVar();
+        }
+
+        private void ReconstructAudio() {
+            if (ReconstructAudioNextActionTimestamp != null)
+                return;
+
+            ReconstructAudioNextActionTimestamp = DateTime.Now;
+            ReconstructAudioStep = 0;
+            _chatGui.Print(string.Format("[{0}] Completely reloading audio.\n* Your sound settings from System Settings will not take effect until you change respective options again.\n* Your background music may stop playing until it changes.\n* Part of game audio may stop working until restart.\n* Restarting the game is still recommended.", Name));
+        }
+
+        private void OnFrameworkUpdate(Framework framework) {
+            if (ReconstructAudioNextActionTimestamp == null || ReconstructAudioNextActionTimestamp >= DateTime.Now)
+                return;
+
+            if (_config.PrintAudioResetToChat)
+                _chatGui.Print(string.Format("[{0}] Completely reloading audio. (Step {1})", Name, ReconstructAudioStep + 1));
+
+            if (ReconstructAudioStep == 0) {
+                ReconstructAudioNextActionTimestamp = DateTime.Now.AddMilliseconds(300);
+                ReconstructAudioStep = 1;
+
+                SetEvent(*_phAudioRenderClientThreadExitEvent);
+                _pfnMainAudioClass_Cleanup(**_ppMainAudioClass);
+                PluginLog.Information("Cleanup");
+
+            } else if (ReconstructAudioStep == 1) {
+                if (_config.EnableOrchestrionIntegration) {
+                    ReconstructAudioNextActionTimestamp = DateTime.Now.AddMilliseconds(100);
+                    ReconstructAudioStep = 2;
+                } else {
+                    ReconstructAudioNextActionTimestamp = null;
+                    ReconstructAudioStep = 0;
+                }
+
+                _pfnMainAudioClass_Construct(**_ppMainAudioClass, true, false);
+                PluginLog.Information("Construct");
+                _pfnMainAudioClass_Initialize(**_ppMainAudioClass, false, IntPtr.Zero);
+                PluginLog.Information("Initialize");
+                _pfnMainAudioClass_SetStaticAddr2(**_ppMainAudioClass);
+                PluginLog.Information("SetStaticAddr2");
+
+            } else if (ReconstructAudioStep == 2) {
+                ReconstructAudioNextActionTimestamp = DateTime.Now.AddMilliseconds(100);
+                ReconstructAudioStep = 3;
+
+                try {
+                    if (_config.EnableOrchestrionIntegration)
+                        _orchPlaySong.InvokeFunc(1);
+                } catch (IpcNotReadyError) {
+                    // pass
+                }
+
+            } else if (ReconstructAudioStep == 3) {
+                ReconstructAudioNextActionTimestamp = null;
+                ReconstructAudioStep = 0;
+
+                try {
+                    if (_config.EnableOrchestrionIntegration)
+                        _orchPlaySong.InvokeFunc(0);
+                } catch (IpcNotReadyError) {
+                    // pass
+                }
+            }
         }
 
         private void OnCommand(string command, string arguments) {
@@ -452,6 +554,9 @@ namespace ResetAudio {
 
             } else if (arguments.Length > 0 && arguments.Length <= 5 && "reset"[..arguments.Length] == arguments) {
                 ResetAudioNow(DeviceResetTriggerReason.UserRequest);
+
+            } else if (arguments.Length > 0 && arguments.Length <= 6 && "harder"[..arguments.Length] == arguments) {
+                ReconstructAudio();
 
             } else if (arguments.Length > 0 && arguments.Length <= 4 && "help"[..arguments.Length] == arguments) {
                 _chatGui.Print(SlashCommandHelpMessage);
@@ -596,5 +701,8 @@ namespace ResetAudio {
             DefaultDeviceChange,
             DefaultDevicePropertyChange,
         }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetEvent(IntPtr hEvent);
     }
 }
