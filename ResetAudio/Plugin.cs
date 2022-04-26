@@ -53,22 +53,21 @@ namespace ResetAudio {
             internal static readonly string AudioRenderClientThreadBody = string.Join(' ', new string[]{
                 // Function preamble
                 /* 0x00 */ "40 56"                      , // PUSH rsi
-                /* 0x02 */ "41 57"                      , // PUSH r15
-                /* 0x04 */ "48 81 ec ?? ?? ?? ??"       , // SUB rsp, 0x000000A8
+                /* 0x02 */ "48 81 ec ?? ?? ?? ??"       , // SUB rsp, 0x000000A8
             
                 // Stack guard
-                /* 0x0B */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF5AB0]
-                /* 0x12 */ "48 33 c4"                   , // XOR rax, rsp
-                /* 0x15 */ "48 89 44 24 ??"             , // MOV [rsp+0x44], rax
+                /* 0x09 */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF5AB0]
+                /* 0x10 */ "48 33 c4"                   , // XOR rax, rsp
+                /* 0x13 */ "48 89 44 24 ??"             , // MOV [rsp+0x44], rax
 
                 // CoInitializeEx(0, 0)
-                /* 0x1A */ "33 d2"                      , // XOR edx, edx
-                /* 0x1C */ "33 c9"                      , // XOR ecx, ecx
-                /* 0x1E */ "40 32 f6"                   , // XOR sil, sil
-                /* 0x21 */ "ff 15 ?? ?? ?? ??"          , // CALL CoInitializeEx
+                /* 0x18 */ "33 d2"                      , // XOR edx, edx
+                /* 0x1A */ "33 c9"                      , // XOR ecx, ecx
+                /* 0x1C */ "40 32 f6"                   , // XOR sil, sil
+                /* 0x1F */ "ff 15 ?? ?? ?? ??"          , // CALL CoInitializeEx
             
                 // The event handle we want, which gets set on exit request.
-                /* 0x27 */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF6E40]
+                /* 0x25 */ "48 8b 05 ?? ?? ?? ??"       , // MOV rax, [ffxiv_dx11.exe+0x1EF6E40]
             });
 
             internal static readonly string MainAudioClass_Construct = string.Join(' ', new string[] {
@@ -96,9 +95,10 @@ namespace ResetAudio {
                 "48 8b 05 ?? ?? ?? ??"                  , // MOV rax, [ffxiv_dx11.exe+0x1EF5AB0]
                 "48 33 c4"                              , // XOR rax, rsp
                 "48 89 85 ?? ?? ?? ??"                  , // MOV [rbp+0x4e0], rax
-                "48 8b 05 ?? ?? ?? ??"                  , // MOV rax, [ffxiv_dx11.exe+0x1F12FD8]
-                "4d 8b c8"                              , // MOV r9, r8
-                "0f b6 f2"                              , // MOVZX esi, dl
+                "48 8b d9"                              , // MOV rbx, rcx
+                "48 8b 0d ?? ?? ?? ??"                  , // MOV rac, [ffxiv_dx11.exe+0x1F12FD8]
+                "49 8b f8"                              , // MOV rdi, r8
+                "44 0f b6 f2"                           , // MOVZX r14d, dl
             });
 
             internal static readonly string MainAudioClass_Cleanup = string.Join(' ', new string[] {
@@ -211,7 +211,7 @@ namespace ResetAudio {
                 _disposableList.Add(Tuple.Create<IDisposable?, Action?>(null, () => { _framework.Update -= OnFrameworkUpdate; }));
 
                 var pAudioRenderClientThreadBody = sigScanner.ScanText(MemorySignatures.AudioRenderClientThreadBody);
-                var pOpBase = pAudioRenderClientThreadBody + 0x2E;
+                var pOpBase = pAudioRenderClientThreadBody + 0x2C;
                 _phAudioRenderClientThreadExitEvent = (IntPtr*)(pOpBase + Marshal.ReadInt32(pOpBase - 0x04));
                 PluginLog.Verbose($"phAudioRenderClientThreadExitEvent: {MainModuleRva((IntPtr)_phAudioRenderClientThreadExitEvent)}");
 
